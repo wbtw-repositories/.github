@@ -1,0 +1,436 @@
+# Reusable AI Code Review Workflow for GDT
+# Called from individual repos via workflow_call.
+# Uses Claude to review PRs + auto-fix on a separate branch.
+#
+# Usage in any repo:
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened]
+#   jobs:
+#     ai-review:
+#       uses: wbtw-repositories/.github/.github/workflows/ai-code-review.yml@main
+#       secrets: inherit
+
+name: AI Code Review
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  ai-review:
+    name: AI Review
+    runs-on: [self-hosted, gdt-ai]
+    if: |
+      !contains(github.event.pull_request.labels.*.name, 'ai-reviewed') &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-ai-review')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+
+          if ! gh pr diff $PR_NUMBER > /tmp/pr-diff.txt 2>/dev/null; then
+            echo "Warning: PR diff too large for GitHub API, using git diff instead"
+            BASE_BRANCH=${{ github.event.pull_request.base.ref }}
+            HEAD_SHA=${{ github.event.pull_request.head.sha }}
+            git diff origin/$BASE_BRANCH...$HEAD_SHA --stat > /tmp/pr-diff.txt
+            echo "" >> /tmp/pr-diff.txt
+            echo "---" >> /tmp/pr-diff.txt
+            echo "# Diff too large. Showing summary only:" >> /tmp/pr-diff.txt
+            echo "" >> /tmp/pr-diff.txt
+            git diff origin/$BASE_BRANCH...$HEAD_SHA --name-only >> /tmp/pr-diff.txt
+          fi
+
+          if [ $(wc -c < /tmp/pr-diff.txt) -gt 50000 ]; then
+            head -c 50000 /tmp/pr-diff.txt > /tmp/pr-diff-truncated.txt
+            echo "" >> /tmp/pr-diff-truncated.txt
+            echo "... (diff truncated - too large for full review)" >> /tmp/pr-diff-truncated.txt
+            mv /tmp/pr-diff-truncated.txt /tmp/pr-diff.txt
+          fi
+
+          PR_TITLE=$(gh pr view $PR_NUMBER --json title -q '.title')
+          PR_BODY=$(gh pr view $PR_NUMBER --json body -q '.body' | head -c 2000)
+          echo "PR_TITLE=$PR_TITLE" >> $GITHUB_ENV
+          echo "title=$PR_TITLE" >> $GITHUB_OUTPUT
+
+      - name: Run AI review
+        id: review
+        run: |
+          cat > /tmp/review-prompt.txt << 'PROMPT_EOF'
+          You are a senior code reviewer for GDT's diagnostic.ly platform — a HIPAA-compliant
+          multi-tenant healthcare SaaS. The platform consists of 5 components:
+
+          - WordPress (wp-mlb)
+          - Node API (diagnostic.ly-nodejs) — Bun runtime, TypeScript
+          - WHMgr Laravel (whmgr-laravel) — PHP 8.1, Laravel 11
+          - WHMgr Node (whmgr-node)
+          - App PHP (app.diagnostic.ly) — PHP 8.1
+
+          Infrastructure: AWS us-west-2, MySQL on EC2, deployed via GitHub Actions (OIDC + SSM).
+
+          Review this PR diff for the following categories:
+
+          ## 1. CRITICAL ISSUES (must fix before merge)
+          - Security vulnerabilities (SQL injection, XSS, auth bypass)
+          - PHI/PII exposure (logging patient data, improper access controls)
+          - HIPAA violations (unencrypted PHI, missing audit trails)
+          - Multi-tenant data isolation failures (cross-tenant leakage)
+          - WordPress-specific: unescaped output, missing nonces, plugin vulnerabilities
+          - Laravel-specific: mass assignment, missing CSRF, raw queries with user input
+          - Node.js-specific: eval() with user input, missing auth middleware
+          - MySQL: non-parameterized queries, credential exposure
+          - Breaking changes to public APIs
+
+          ## 2. IMPORTANT ISSUES (should fix)
+          - Missing error handling (try/catch, error boundaries)
+          - Type safety concerns (TypeScript strict, PHP type hints)
+          - Missing null/undefined checks
+          - Incomplete migrations or schema changes
+          - Missing input validation (Zod, Laravel validation, WordPress sanitization)
+          - PM2/process management concerns
+
+          ## 3. SUGGESTIONS (nice to have)
+          - Code organization improvements
+          - Performance optimizations (MySQL query efficiency, N+1 queries)
+          - Better naming conventions
+          - Missing documentation
+          - Laravel best practices (Eloquent over raw, service classes)
+          - WordPress coding standards
+
+          ## 4. POSITIVE NOTES
+          - Well-implemented features
+          - Good patterns used
+          - Proper HIPAA-compliant implementations
+
+          For each issue found, specify:
+          - File and line number if possible
+          - What the issue is
+          - How to fix it
+
+          If no issues are found in a category, say "None found."
+
+          ---
+          PR Title: $PR_TITLE
+
+          PR Description:
+          $PR_BODY
+
+          Diff:
+          PROMPT_EOF
+
+          cat /tmp/pr-diff.txt >> /tmp/review-prompt.txt
+
+          if command -v claude &> /dev/null; then
+            claude --print "$(cat /tmp/review-prompt.txt)" > /tmp/review-result.md 2>&1 || {
+              echo "# AI Review" > /tmp/review-result.md
+              echo "" >> /tmp/review-result.md
+              echo "AI review unavailable - Claude CLI not responding." >> /tmp/review-result.md
+            }
+          else
+            echo "# AI Review" > /tmp/review-result.md
+            echo "" >> /tmp/review-result.md
+            echo "AI review skipped - Claude CLI not available on this runner." >> /tmp/review-result.md
+          fi
+
+          CRITICAL_SECTION=$(sed -n '/## 1\. CRITICAL/,/## 2\./p' /tmp/review-result.md || echo "")
+          if echo "$CRITICAL_SECTION" | grep -qE "(CRITICAL)" && ! echo "$CRITICAL_SECTION" | grep -qi "None found"; then
+            echo "has_critical=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_critical=false" >> $GITHUB_OUTPUT
+          fi
+
+          IMPORTANT_SECTION=$(sed -n '/## 2\. IMPORTANT/,/## 3\./p' /tmp/review-result.md || echo "")
+          if echo "$IMPORTANT_SECTION" | grep -qE "(IMPORTANT|should fix|missing)" && ! echo "$IMPORTANT_SECTION" | grep -qi "None found"; then
+            echo "has_important=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_important=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "review_complete=true" >> $GITHUB_OUTPUT
+        env:
+          PR_TITLE: ${{ env.PR_TITLE }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+
+      - name: Auto-fix review issues
+        id: autofix
+        if: steps.review.outputs.review_complete == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          FIXES_APPLIED=false
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create a separate fix branch — never push directly to the PR author's branch
+          FIX_BRANCH="ai-fix/${PR_BRANCH}"
+          git checkout -b "$FIX_BRANCH"
+
+          # Extract all actionable issues from review
+          ISSUES=$(grep -E "^[[:space:]]*[-*].*" /tmp/review-result.md | grep -Ev "^[[:space:]]*[-*][[:space:]]*(None found|Well-implemented|Good pattern|Proper)" | head -30 || true)
+
+          if [ -z "$ISSUES" ]; then
+            echo "No actionable issues found to fix"
+            echo "fixes_applied=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Create fix prompt with full review context
+          cat > /tmp/fix-prompt.txt << 'FIXEOF'
+          You MUST fix ALL code review issues below — critical, important, AND suggestions.
+          This is a CI/CD pipeline for the GDT diagnostic.ly HIPAA-compliant healthcare platform.
+          You have full tool access.
+
+          CRITICAL: Use the Edit tool to modify files. Do NOT just describe fixes.
+
+          Platform context:
+          - Node.js/TypeScript with Bun runtime
+          - PHP 8.1, Laravel 11
+          - WordPress
+          - MySQL databases
+          - HIPAA regulated — PHI must never appear in logs
+
+          Full review output:
+          FIXEOF
+          cat /tmp/review-result.md >> /tmp/fix-prompt.txt
+          cat >> /tmp/fix-prompt.txt << 'FIXEOF'
+
+          REQUIRED ACTIONS:
+          1. Use the Read tool to read each file mentioned
+          2. Use the Edit tool to fix each issue - make actual code changes
+          3. Fix ALL categories: critical, important, AND suggestions
+          4. For security issues: add validation, remove hardcoded secrets, fix injection risks
+          5. For missing error handling: add try/catch blocks (TypeScript) or try/catch (PHP)
+          6. For type issues: add proper TypeScript types or PHP type hints
+          7. For HIPAA issues: remove PHI from logs, add encryption, add audit logging
+          8. For WordPress: add proper escaping (esc_html, esc_attr), add nonce verification
+          9. For Laravel: add validation rules, CSRF protection, Eloquent scoping
+          10. Do NOT skip any issues - fix ALL of them
+          11. Skip items in "POSITIVE NOTES" — those are compliments, not issues
+
+          After fixing, the workflow will commit your changes automatically.
+          FIXEOF
+
+          if command -v claude &> /dev/null; then
+            echo "Running Claude Code to fix issues..."
+            timeout 300 claude --dangerously-skip-permissions -p "$(cat /tmp/fix-prompt.txt)" 2>&1 || {
+              echo "Claude fix attempt timed out or failed"
+            }
+
+            if [ -n "$(git status --porcelain)" ]; then
+              git add -A
+              git commit -m "fix: AI review fixes for PR #${PR_NUMBER}
+
+          Automated fixes for issues found during AI code review.
+          These changes are on a separate branch for the PR author to review.
+
+          Co-Authored-By: Claude <noreply@anthropic.com>" || true
+
+              git push origin "$FIX_BRANCH" --force 2>&1 || {
+                echo "Failed to push fix branch"
+                echo "fixes_applied=false" >> $GITHUB_OUTPUT
+                exit 0
+              }
+
+              FIXES_APPLIED=true
+              echo "Fix branch pushed: $FIX_BRANCH"
+            fi
+          fi
+
+          if [ "$FIXES_APPLIED" = true ]; then
+            echo "fixes_applied=true" >> $GITHUB_OUTPUT
+            echo "fix_branch=$FIX_BRANCH" >> $GITHUB_OUTPUT
+          else
+            echo "fixes_applied=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "$FIXES_APPLIED" != true ] && [ "${{ steps.review.outputs.has_critical }}" != "true" ]; then
+            echo "approve_with_suggestions=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reviewContent = fs.readFileSync('/tmp/review-result.md', 'utf8');
+
+            const body = `## AI Code Review (GDT / diagnostic.ly)
+
+            ${reviewContent}
+
+            ---
+            <sub>Automated review by Claude for GDT HIPAA-compliant platform. Add \`skip-ai-review\` label to disable.</sub>`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const existingComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('AI Code Review')
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+      - name: Add ai-reviewed label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create "ai-reviewed" --color "7057ff" --force 2>/dev/null || true
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "ai-reviewed"
+
+      - name: Comment with fix branch for PR author
+        if: steps.autofix.outputs.fixes_applied == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fixBranch = '${{ steps.autofix.outputs.fix_branch }}';
+            const prAuthor = '${{ github.event.pull_request.user.login }}';
+
+            const body = `## AI Auto-Fix Available
+
+            @${prAuthor} — I found fixes for the review issues above and pushed them to a separate branch:
+
+            **Fix branch:** \`${fixBranch}\`
+
+            To accept the fixes, merge them into your branch:
+            \`\`\`bash
+            git fetch origin ${fixBranch}
+            git merge origin/${fixBranch}
+            \`\`\`
+
+            Or cherry-pick specific commits:
+            \`\`\`bash
+            git fetch origin ${fixBranch}
+            git log origin/${fixBranch} --oneline  # review commits
+            git cherry-pick <commit-sha>
+            \`\`\`
+
+            To reject: just ignore this — the fix branch will not be merged automatically.
+
+            ---
+            <sub>AI Auto-Fix · fixes are never pushed directly to your branch</sub>`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'ai-fix-available',
+                color: '7057ff',
+                description: 'AI auto-fix branch available for review'
+              });
+            } catch (e) { /* label exists */ }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['ai-fix-available']
+            });
+
+      - name: Approve if no critical issues
+        if: |
+          steps.autofix.outputs.approve_with_suggestions == 'true' ||
+          (steps.review.outputs.has_critical != 'true' && steps.review.outputs.has_important != 'true')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const approveWithSuggestions = '${{ steps.autofix.outputs.approve_with_suggestions }}' === 'true';
+            let body = 'AI Code Review (GDT) ';
+            body += approveWithSuggestions
+              ? '- No critical issues found. Approving with suggestions (see comments above).'
+              : '- No issues found. Approving PR.';
+
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            for (const review of reviews) {
+              if (review.state === 'CHANGES_REQUESTED' && review.user.type === 'Bot') {
+                await github.rest.pulls.dismissReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  review_id: review.id,
+                  message: 'Issues resolved or deemed non-blocking'
+                });
+              }
+            }
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'APPROVE',
+              body: body
+            });
+
+      - name: Request changes if critical issues remain unfixed
+        if: |
+          steps.review.outputs.has_critical == 'true' &&
+          steps.autofix.outputs.fixes_applied != 'true' &&
+          steps.autofix.outputs.approve_with_suggestions != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'REQUEST_CHANGES',
+              body: 'AI review found CRITICAL issues that could not be auto-fixed. Manual intervention required. See the AI Code Review comment above.'
+            });
+
+      - name: Block merge only for unfixed critical issues
+        if: |
+          steps.review.outputs.has_critical == 'true' &&
+          steps.autofix.outputs.fixes_applied != 'true' &&
+          steps.autofix.outputs.approve_with_suggestions != 'true'
+        run: |
+          echo "AI Code Review found CRITICAL issues that could not be auto-fixed:"
+          echo ""
+          cat /tmp/review-result.md | grep -A5 "CRITICAL" | head -20 || true
+          echo ""
+          echo "Please fix these manually or add 'skip-ai-review' label to bypass."
+          exit 1
