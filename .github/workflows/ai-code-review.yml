@@ -466,6 +466,106 @@ jobs:
               });
             }
 
+      # -- PHASE 4: FEEDBACK PROPOSALS + METRICS --------------------------------
+      - name: Extract do's and don'ts proposals
+        if: |
+          steps.review.outputs.has_critical == 'true' || steps.review.outputs.has_important == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! command -v claude &> /dev/null; then
+            echo "Claude CLI not available — skipping proposals"
+            exit 0
+          fi
+
+          REVIEW=$(cat /tmp/review-result.md)
+
+          # Ask Claude to extract generalizable rules from this review
+          claude --print "Based on this code review, extract any NEW generalizable coding rules that should be added to our do's and don'ts.
+
+          Only extract rules that are:
+          1. Not already obvious (e.g., don't extract 'use parameterized queries' — that's universal)
+          2. Specific to our platform patterns (diagnostic.ly, Laravel, HIPAA, multi-tenant)
+          3. Would prevent this class of bug in future PRs
+
+          Format each as:
+          TYPE: DO or DONT
+          RULE: one-line rule
+          REASON: why this matters
+          EXAMPLE: brief code example if helpful
+
+          If no new rules are worth extracting, say: NO_NEW_RULES
+
+          Review findings:
+          $REVIEW" > /tmp/proposals.txt 2>&1 || exit 0
+
+          # Check if there are proposals
+          if grep -q "NO_NEW_RULES" /tmp/proposals.txt; then
+            echo "No new rules to propose"
+            exit 0
+          fi
+
+          # Post proposals as a comment on the PR for human review
+          PROPOSALS=$(cat /tmp/proposals.txt)
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="## 📋 Proposed Do's & Don'ts
+
+          The AI review identified patterns that could become permanent coding rules.
+          **These are proposals — a human must approve before they're added to shared context.**
+
+          ${PROPOSALS}
+
+          ---
+          _To approve a rule: copy it to the \`#sctxt-proposals\` Slack channel or add to \`CLAUDE.md\`._
+          _Auto-extracted by AI Code Review._" || true
+
+      - name: Collect review metrics
+        if: always() && steps.review.outputs.review_complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Extract metrics from review
+          VERDICT="${{ steps.review.outputs.verdict }}"
+          HAS_CRITICAL="${{ steps.review.outputs.has_critical }}"
+          HAS_IMPORTANT="${{ steps.review.outputs.has_important }}"
+          FIXES_PUSHED="${{ steps.autofix.outputs.fixes_pushed }}"
+          FIXED_COUNT="${{ steps.autofix.outputs.fixed_count }}"
+          ITERATIONS="${{ steps.autofix.outputs.iterations }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Count issues by severity from review
+          CRITICAL_COUNT=$(grep -c "^\- \*\*security\|^\- \*\*hipaa" /tmp/review-result.md 2>/dev/null || echo "0")
+          HIGH_COUNT=$(grep -c "^\- \*\*logic-error\|^\- \*\*error-handling" /tmp/review-result.md 2>/dev/null || echo "0")
+          MEDIUM_COUNT=$(grep -c "^\- \*\*convention-violation" /tmp/review-result.md 2>/dev/null || echo "0")
+          LOW_COUNT=$(grep -c "^\- \*\*code-quality" /tmp/review-result.md 2>/dev/null || echo "0")
+
+          # Post metrics as a PR comment (machine-readable JSON block)
+          METRICS="{
+            \"timestamp\": \"$TIMESTAMP\",
+            \"repo\": \"$REPO\",
+            \"pr\": $PR_NUM,
+            \"verdict\": \"$VERDICT\",
+            \"critical\": $CRITICAL_COUNT,
+            \"high\": $HIGH_COUNT,
+            \"medium\": $MEDIUM_COUNT,
+            \"low\": $LOW_COUNT,
+            \"auto_fix_attempted\": $( [ -n \"$ITERATIONS\" ] && [ \"$ITERATIONS\" != \"0\" ] && echo true || echo false ),
+            \"auto_fix_success\": $( [ \"$FIXES_PUSHED\" = \"true\" ] && echo true || echo false ),
+            \"files_fixed\": ${FIXED_COUNT:-0},
+            \"iterations\": ${ITERATIONS:-0}
+          }"
+
+          echo "Review metrics: $METRICS"
+
+          # Store metrics — append to a log file via GitHub API
+          echo "$METRICS" >> /tmp/review-metrics.jsonl
+
+          # Also add as hidden comment for future dashboard scraping
+          gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            -f body="<!-- AI_REVIEW_METRICS ${METRICS} -->" || true
+
       # -- LABEL + APPROVE/REJECT ----------------------------------------------
       - name: Add ai-reviewed label
         if: always()
