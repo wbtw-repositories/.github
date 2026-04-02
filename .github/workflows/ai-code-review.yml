@@ -554,6 +554,58 @@ jobs:
               body: 'AI review found issues that could not be auto-fixed. Manual intervention required. See the AI Code Review comment above.'
             });
 
+      - name: Escalate to Sling for autonomous fix
+        if: |
+          (steps.review.outputs.has_critical == 'true' || steps.review.outputs.has_important == 'true') &&
+          steps.autofix.outputs.fixes_pushed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Auto-fix failed — escalating to Sling..."
+
+          # Extract remaining issues from review
+          REMAINING_ISSUES=$(cat /tmp/review-result.md)
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          # Create a Sling ticket with the review findings
+          ISSUE_BODY="## Auto-Fix Escalation from PR #${PR_NUM}
+
+          The AI code review found issues on [PR #${PR_NUM}](${PR_URL}) that could not be auto-fixed.
+
+          **Branch:** \`${HEAD_BRANCH}\`
+          **PR Title:** ${PR_TITLE}
+
+          ## Review Findings to Fix
+
+          ${REMAINING_ISSUES}
+
+          ## Instructions
+
+          1. Check out branch \`${HEAD_BRANCH}\`
+          2. Fix all CRITICAL and IMPORTANT issues listed above
+          3. Run tests to verify
+          4. Push fixes to the branch
+          5. The AI review will re-run automatically on the push
+
+          ## Context
+
+          This issue was auto-created by the AI code review workflow after auto-fix failed.
+          Original PR: #${PR_NUM}"
+
+          # Create issue — Sling will pick it up via auto-implement label
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "fix: AI review escalation — ${PR_TITLE}" \
+            --body "${ISSUE_BODY}" \
+            --label "auto-implement" \
+            --label "claude-code" \
+            --label "p1" 2>&1 || echo "Failed to create Sling ticket"
+
+          echo "Sling ticket created — will be picked up automatically."
+
       - name: Fail check if critical issues remain unfixed
         if: |
           steps.review.outputs.has_critical == 'true' &&
