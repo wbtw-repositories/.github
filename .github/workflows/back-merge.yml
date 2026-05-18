@@ -2,25 +2,38 @@ name: Back-merge (reusable)
 
 # Org-shared back-merge workflow — Ref infra#624 Phase 3a, infra#429.
 #
-# Ports the per-repo back-merge logic (originally landed in
-# app.diagnostic.ly/.github/workflows/back-merge-main.yml) to a single
-# source-of-truth callable workflow. Each consuming repo invokes this
-# via `uses: wbtw-repositories/.github/.github/workflows/back-merge.yml@main`
-# in a thin shim workflow that only specifies its targets list.
+# Reusable callable workflow that opens a PR back-merging the
+# `source` branch into each branch in `targets`. Supports both the
+# legacy single-stage matrix design (source=main, targets=[uat,
+# develop]) and the 2-stage sequential design from the EPIC:
 #
-# Behaviour preserved from the app.diag original:
-#   - For each lower branch in the targets list, computes drift vs main.
-#   - Opens a sync PR labelled `auto-back-merge` if drift exists and no
-#     open PR already targets that branch.
-#   - Conflicts skip the push and surface a warning — no PRs with conflict
-#     markers ever get pushed.
-#   - Enables auto-merge on the opened PR so it self-closes once CI is green.
-#   - Notifies #devops on workflow failure (5-days-red anti-pattern from
+#   Stage 1 — consumer fires on push to main, calls with
+#             source=main, targets=["uat"]
+#   Stage 2 — consumer fires on push to uat, calls with
+#             source=uat, targets=["develop"]
+#
+# Sequential is the EPIC's preferred design (prevents develop from
+# landing ahead of uat, which would skip the staging-passed QA gate).
+# Matrix is preserved for repos that don't have a uat branch or want
+# parallel back-merges.
+#
+# Behaviour:
+#   - For each target, computes drift vs source.
+#   - Opens a sync PR labelled `auto-back-merge` if drift exists and
+#     no open PR already targets that branch from the same source.
+#   - Conflicts skip the push and surface a warning — no PRs with
+#     conflict markers ever get pushed.
+#   - Enables auto-merge on the opened PR so it self-closes once CI
+#     is green (anti-loop guard on `sync/...: back-merge` in commit
+#     message is implicit — these workflows only fire on push, never
+#     on PR merge of a sync branch).
+#   - Notifies #devops on workflow failure (anti-5-days-red from
 #     infra#417).
 #
-# Consumer shim example (place in each repo as .github/workflows/back-merge.yml):
+# Consumer shim — sequential (recommended):
 #
-#   name: Back-merge main → lower branches
+#   # .github/workflows/back-merge-stage1.yml
+#   name: Back-merge main → uat
 #   on:
 #     push:
 #       branches: [main]
@@ -29,16 +42,50 @@ name: Back-merge (reusable)
 #     back-merge:
 #       uses: wbtw-repositories/.github/.github/workflows/back-merge.yml@main
 #       with:
-#         targets: '["uat", "develop"]'
+#         source: main
+#         targets: '["uat"]'
 #       secrets:
 #         PROMOTION_PAT: ${{ secrets.PROMOTION_PAT }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+#
+#   # .github/workflows/back-merge-stage2.yml
+#   name: Back-merge uat → develop
+#   on:
+#     push:
+#       branches: [uat]
+#     workflow_dispatch:
+#   jobs:
+#     back-merge:
+#       uses: wbtw-repositories/.github/.github/workflows/back-merge.yml@main
+#       with:
+#         source: uat
+#         targets: '["develop"]'
+#       secrets:
+#         PROMOTION_PAT: ${{ secrets.PROMOTION_PAT }}
+#         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+#
+# Consumer shim — legacy matrix (back-compat):
+#
+#   on:
+#     push:
+#       branches: [main]
+#   jobs:
+#     back-merge:
+#       uses: wbtw-repositories/.github/.github/workflows/back-merge.yml@main
+#       with:
+#         targets: '["uat", "develop"]'
+#       secrets: {...}
 
 on:
   workflow_call:
     inputs:
+      source:
+        description: 'Source branch (commits flow FROM here INTO each target). Defaults to main.'
+        required: false
+        type: string
+        default: 'main'
       targets:
-        description: 'JSON array of lower branches to back-merge into (e.g. ''["uat", "develop"]'')'
+        description: 'JSON array of branches to back-merge into. Sequential: ["uat"] for stage 1, ["develop"] for stage 2. Matrix (legacy): ["uat", "develop"].'
         required: true
         type: string
       slack_channel:
@@ -60,7 +107,7 @@ permissions:
 
 jobs:
   back-merge:
-    name: ${{ matrix.target }} <- main
+    name: ${{ matrix.target }} <- ${{ inputs.source }}
     strategy:
       fail-fast: false
       matrix:
@@ -69,7 +116,7 @@ jobs:
     timeout-minutes: 10
 
     concurrency:
-      group: back-merge-${{ github.repository }}-${{ matrix.target }}
+      group: back-merge-${{ github.repository }}-${{ inputs.source }}-${{ matrix.target }}
       cancel-in-progress: false
 
     steps:
@@ -88,13 +135,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_PAT || github.token }}
         run: |
-          AHEAD=$(gh api "repos/$GITHUB_REPOSITORY/compare/${{ matrix.target }}...main" --jq '.ahead_by // 0')
+          AHEAD=$(gh api "repos/$GITHUB_REPOSITORY/compare/${{ matrix.target }}...${{ inputs.source }}" --jq '.ahead_by // 0')
           echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
-          echo "main has $AHEAD commits ${{ matrix.target }} doesn't have"
+          echo "${{ inputs.source }} has $AHEAD commits ${{ matrix.target }} doesn't have"
 
       - name: Skip if no drift
         if: steps.drift.outputs.ahead == '0'
-        run: echo "::notice::main and ${{ matrix.target }} are in sync — nothing to back-merge"
+        run: echo "::notice::${{ inputs.source }} and ${{ matrix.target }} are in sync — nothing to back-merge"
 
       - name: Look for existing open back-merge PR
         if: steps.drift.outputs.ahead != '0'
@@ -107,10 +154,10 @@ jobs:
             --state open \
             --label "auto-back-merge" \
             --json number,headRefName \
-            --jq '.[] | select(.headRefName | startswith("sync/main-to-${{ matrix.target }}")) | .number' \
+            --jq '.[] | select(.headRefName | startswith("sync/${{ inputs.source }}-to-${{ matrix.target }}")) | .number' \
             | head -1)
           if [ -n "$EXISTING" ]; then
-            echo "::notice::Existing auto-back-merge PR #$EXISTING is open for ${{ matrix.target }} — skipping new PR (it will pick up new commits on its next sync)"
+            echo "::notice::Existing auto-back-merge PR #$EXISTING is open for ${{ inputs.source }} → ${{ matrix.target }} — skipping new PR (it will pick up new commits on its next sync)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -121,42 +168,41 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_PAT || github.token }}
           AHEAD: ${{ steps.drift.outputs.ahead }}
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ matrix.target }}
         run: |
           DATE=$(date +%Y-%m-%d)
-          BR="sync/main-to-${{ matrix.target }}-${DATE}-${{ github.run_id }}"
-          git fetch origin main "${{ matrix.target }}"
-          git checkout -b "$BR" "origin/${{ matrix.target }}"
+          BR="sync/${SOURCE}-to-${TARGET}-${DATE}-${{ github.run_id }}"
+          git fetch origin "$SOURCE" "$TARGET"
+          git checkout -b "$BR" "origin/${TARGET}"
 
-          if git merge origin/main --no-ff -m "merge: main → ${{ matrix.target }} — auto-back-merge ($AHEAD commits)"; then
+          if git merge "origin/${SOURCE}" --no-ff -m "merge: ${SOURCE} → ${TARGET} — auto-back-merge ($AHEAD commits)"; then
             git push origin "$BR"
 
             BODY=$(cat <<BODY_EOF
           ## Auto-back-merge
 
-          Automated PR opened by the org-shared \`back-merge.yml\` workflow because main has $AHEAD commits that \`${{ matrix.target }}\` is missing.
+          Automated PR opened by the org-shared \`back-merge.yml\` workflow because \`${SOURCE}\` has $AHEAD commits that \`${TARGET}\` is missing.
 
           **Drift size:** $AHEAD commits
+          **Source:** \`${SOURCE}\`
+          **Target:** \`${TARGET}\`
 
           If checks are green and there are no concerns, this can be admin-merged. The merge was clean (no conflicts).
 
-          **Why this exists:** infra#429 audit caught accumulated drift across all 4 GDT repos. infra#624 Phase 3a moved this workflow to org-shared so all repos get the same behaviour without per-repo drift.
+          **Why this exists:** infra#624 Phase 3a — back-merge drift fix-up automation, sequential design prevents develop landing ahead of uat (which would skip the staging-passed QA gate).
 
-          **Triggered by:** $GITHUB_SHA on main.
+          **Triggered by:** $GITHUB_SHA on \`${SOURCE}\`.
           **Workflow run:** [$GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)
           BODY_EOF
           )
 
             PR_URL=$(gh pr create \
-              --base "${{ matrix.target }}" --head "$BR" \
-              --title "sync: main → ${{ matrix.target }} — auto-back-merge ($AHEAD commits)" \
+              --base "${TARGET}" --head "$BR" \
+              --title "sync: ${SOURCE} → ${TARGET} — auto-back-merge ($AHEAD commits)" \
               --body "$BODY" \
               --label "auto-back-merge")
 
-            # Enable auto-merge so the PR self-closes once CI is green.
-            # If auto-merge is disabled at the repo level the call returns
-            # non-zero — the PR still stays open with the auto-back-merge
-            # label, matching the original app.diag behaviour. Never fail
-            # the workflow on this fallback path.
             if [ -n "$PR_URL" ]; then
               if gh pr merge "$PR_URL" --auto --merge 2>&1; then
                 echo "::notice::Auto-merge enabled on $PR_URL — will merge when checks pass"
@@ -165,7 +211,7 @@ jobs:
               fi
             fi
           else
-            echo "::warning::Merge conflicts detected on main → ${{ matrix.target }}. Branch NOT pushed; manual back-merge required. Drift: $AHEAD commits."
+            echo "::warning::Merge conflicts detected on ${SOURCE} → ${TARGET}. Branch NOT pushed; manual back-merge required. Drift: $AHEAD commits."
             git merge --abort 2>/dev/null || true
           fi
 
@@ -184,6 +230,6 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{
               \"channel\": \"$SLACK_CHANNEL\",
-              \"text\": \":rotating_light: *Back-merge failed* on \`${{ github.repository }}\` — main → ${{ matrix.target }}: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|view run>\",
+              \"text\": \":rotating_light: *Back-merge failed* on \`${{ github.repository }}\` — ${{ inputs.source }} → ${{ matrix.target }}: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|view run>\",
               \"unfurl_links\": false
             }" > /dev/null
